@@ -111,6 +111,25 @@ struct icmp_hdr {
     unsigned short seq;       // Sequence number (used for echo requests/replies)
 };
 
+void print_pcap_header(struct pcap_file_header *pfh) {
+    printf("PCAP File Header:\n");
+    printf("   |-Magic Number       : 0x%08x\n", pfh->magic);
+    printf("   |-Version Major      : %d\n", pfh->version_major);
+    printf("   |-Version Minor      : %d\n", pfh->version_minor);
+    printf("   |-This Zone          : %d\n", pfh->thiszone);
+    printf("   |-Sigfigs            : %d\n", pfh->sigfigs);
+    printf("   |-Snaplen            : %d\n", pfh->snaplen);
+    printf("   |-Linktype           : %d\n", pfh->linktype);
+}
+
+void print_pcap_packet_header(struct pcap_pkthdr *pph) {
+    printf("PCAP Packet Header:\n");
+    printf("   |-Timestamp Seconds  : %u\n", pph->ts_secs);
+    printf("   |-Timestamp Microsecs: %u\n", pph->ts_usecs);
+    printf("   |-Captured Length    : %u\n", pph->caplen);
+    printf("   |-Original Length    : %u\n", pph->len);
+}
+
 void print_ethernet(struct eth_hdr *peh) {
     printf("Ethernet Header\n");
     printf("   |-Destination Address : %02x:%02x:%02x:%02x:%02x:%02x \n", 
@@ -260,21 +279,15 @@ void respond_to_icmp_echo_request(int writefd, struct pcap_pkthdr *pcap, eth_hdr
     pph.ts_usecs = pcap->ts_usecs;
     pph.caplen = packet_len; // Use the same length as the original packet
     pph.len = packet_len; // Use the same length as the original packet
-    if(debug==1) {
-        printf("Pcap Header\n");
-        printf("   |-Timestamp: %u.%06u\n", pph.ts_secs, pph.ts_usecs);
-        printf("   |-Captured Length: %u\n", pph.caplen);
-        printf("   |-Original Length: %u\n", pph.len);
+
+    if(debug == 1) {
+        print_pcap_packet_header(&pph);
     }
 
     // Prepare Ethernet header
     memcpy(eth_resp.dst, eth->src, 6); // Swap source and destination MAC addresses
     memcpy(eth_resp.src, eth->dst, 6);
     eth_resp.type = eth->type;
-    if(debug==1) {
-        printf("Eth Response Header");
-        print_ethernet(&eth_resp);
-    }
 
     // Prepare IP header
     ip_resp.ver_ihl = iph->ver_ihl;
@@ -288,10 +301,6 @@ void respond_to_icmp_echo_request(int writefd, struct pcap_pkthdr *pcap, eth_hdr
     ip_resp.src = iph->dst; // Swap source and destination IP addresses
     ip_resp.dst = iph->src;
 
-    if(debug==1){
-        printf("IP Response Header");
-        print_ip(&ip_resp);
-    }
     // Calculate IP checksum
     ip_resp.check = calculate_checksum((unsigned short *)&ip_resp, sizeof(struct ip_hdr));
 
@@ -301,64 +310,71 @@ void respond_to_icmp_echo_request(int writefd, struct pcap_pkthdr *pcap, eth_hdr
     icmp_resp.checksum = 0;
     icmp_resp.id = icmph->id;
     icmp_resp.seq = icmph->seq;
-    
-    if(debug==1)
-    {
-        printf("ICMP Response Header");
-        print_icmp_summary(&icmp_resp);
-    }
-    // Calculate ICMP checksum
+
+    // Calculate ICMP data length
     int icmp_data_len = packet_len - sizeof(struct eth_hdr) - ((iph->ver_ihl & 0x0F) * 4) - sizeof(struct icmp_hdr);
     if (icmp_data_len < 0 || icmp_data_len > 1500) { // Validate ICMP data length
         fprintf(stderr, "Invalid ICMP data length: %d\n", icmp_data_len);
         return;
     }
 
+    // Allocate memory for the ICMP packet (header + data)
     unsigned char *icmp_packet = (unsigned char *)malloc(sizeof(struct icmp_hdr) + icmp_data_len);
     if (!icmp_packet) {
         perror("malloc");
         return;
     }
 
+    // Copy ICMP header and data into the packet
     unsigned char *icmp_data = (unsigned char *)icmph + sizeof(struct icmp_hdr);
     memcpy(icmp_packet, &icmp_resp, sizeof(struct icmp_hdr));
     memcpy(icmp_packet + sizeof(struct icmp_hdr), icmp_data, icmp_data_len);
+
+    // Calculate the ICMP checksum
     icmp_resp.checksum = calculate_checksum((unsigned short *)icmp_packet, sizeof(struct icmp_hdr) + icmp_data_len);
 
-    // Prepare an array of iovec structures for the writev system call.
-    // Each iovec structure represents a buffer to be written.
-    struct iovec iov[10]; // Array of iovec structures, with a maximum of 10 buffers.
-    int v = 0; // Index to track the current iovec entry.
+    // Update the checksum in the ICMP packet
+    memcpy(icmp_packet, &icmp_resp, sizeof(struct icmp_hdr));
+
+    // Debugging: Print the calculated checksum
+    if (debug == 1) {
+        printf("Calculated ICMP Checksum: 0x%x\n", ntohs(icmp_resp.checksum));
+    }
+
+    // Prepare an array of iovec structures for the writev system call
+    struct iovec iov[10];
+    int v = 0;
 
     // Add the pcap header to the iovec array.
     iov[v].iov_base = &pph; // Pointer to the pcap header data.
     iov[v].iov_len = sizeof(struct pcap_pkthdr); // Size of the pcap header.
     ++v; // Move to the next iovec entry.
 
-    // Add the Ethernet header to the iovec array.
-    iov[v].iov_base = &eth_resp; // Pointer to the Ethernet header data.
-    iov[v].iov_len = sizeof(struct eth_hdr); // Size of the Ethernet header.
-    ++v; // Move to the next iovec entry.
+    // Add the Ethernet header to the iovec array
+    iov[v].iov_base = &eth_resp;
+    iov[v].iov_len = sizeof(struct eth_hdr);
+    ++v;
 
-    // Add the IP header to the iovec array.
-    iov[v].iov_base = &ip_resp; // Pointer to the IP header data.
-    iov[v].iov_len = sizeof(struct ip_hdr); // Size of the IP header.
-    ++v; // Move to the next iovec entry.
+    // Add the IP header to the iovec array
+    iov[v].iov_base = &ip_resp;
+    iov[v].iov_len = sizeof(struct ip_hdr);
+    ++v;
 
-    // Add the ICMP packet (header + data) to the iovec array.
-    iov[v].iov_base = icmp_packet; // Pointer to the ICMP packet data.
-    iov[v].iov_len = sizeof(struct icmp_hdr) + icmp_data_len; // Size of the ICMP header plus the payload length.
-    ++v; // Move to the next iovec entry.
+    // Add the ICMP packet (header + data) to the iovec array
+    iov[v].iov_base = icmp_packet;
+    iov[v].iov_len = sizeof(struct icmp_hdr) + icmp_data_len;
+    ++v;
 
     // Write the response
     int rval = writev(writefd, iov, v);
     if (rval < 0) {
         perror("writev");
-    } else if (debug==1) {
+    } else if (debug == 1) {
         printf("Responded to ICMP Echo Request with %d bytes\n", rval);
     }
 
-    free(icmp_packet); // Free the dynamically allocated buffer
+    // Free the dynamically allocated buffer
+    free(icmp_packet);
 }
 
 int main(int argc, char *argv[])
