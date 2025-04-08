@@ -462,7 +462,8 @@ int main(int argc, char *argv[])
         bytes_read = read(fd, &pph, sizeof(pph));
         if (bytes_read < sizeof(pph)) {
             if (bytes_read == 0) {
-                break;
+                usleep(10000); 
+                continue;
             }
             fflush(stdout);
             fprintf(stderr, "truncated packet header: only %u bytes\n", bytes_read);
