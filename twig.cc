@@ -377,6 +377,128 @@ void respond_to_icmp_echo_request(int writefd, struct pcap_pkthdr *pcap, eth_hdr
     free(icmp_packet);
 }
 
+void respond_to_udp_echo_request(int writefd, struct pcap_pkthdr *pcap, eth_hdr *eth, struct ip_hdr *iph, struct udp_hdr *udph, int packet_len) {
+    // Create buffers for the response
+    struct pcap_pkthdr pph;
+    struct eth_hdr eth_resp;
+    struct ip_hdr ip_resp;
+    struct udp_hdr udp_resp;
+
+    // Calculate UDP data length
+    int udp_data_len = ntohs(udph->len) - sizeof(struct udp_hdr);
+    if (udp_data_len < 0 || udp_data_len > 1500) { // Validate UDP data length
+        fprintf(stderr, "Invalid UDP data length: %d\n", udp_data_len);
+        return;
+    }
+
+    // Prepare the pcap header for the response
+    pph.ts_secs = pcap->ts_secs;
+    pph.ts_usecs = pcap->ts_usecs;
+    pph.caplen = sizeof(struct eth_hdr) + sizeof(struct ip_hdr) + sizeof(struct udp_hdr) + udp_data_len;
+    pph.len = pph.caplen;
+
+    if (debug == 1) {
+        print_pcap_packet_header(&pph);
+    }
+
+    // Prepare Ethernet header
+    memcpy(eth_resp.dst, eth->src, 6); // Swap source and destination MAC addresses
+    memcpy(eth_resp.src, eth->dst, 6);
+    eth_resp.type = htons(0x0800); // Set EtherType to IP (0x0800)
+
+    // Prepare IP header
+    ip_resp.ver_ihl = (4 << 4) | (sizeof(struct ip_hdr) / 4); // Version = 4, IHL = 5 (20 bytes)
+    ip_resp.tos = iph->tos;
+    ip_resp.len = htons(sizeof(struct ip_hdr) + sizeof(struct udp_hdr) + udp_data_len); // Total length = IP header + UDP header + data
+    ip_resp.id = iph->id;
+    ip_resp.frag_off = htons(0x4000); // Don't Fragment flag
+    ip_resp.ttl = 64; // Set a default TTL
+    ip_resp.proto = IPPROTO_UDP; // Protocol = UDP
+    ip_resp.check = 0; // Checksum will be calculated later
+    ip_resp.src = iph->dst; // Swap source and destination IP addresses
+    ip_resp.dst = iph->src;
+
+    // Calculate IP checksum
+    ip_resp.check = calculate_checksum((unsigned short *)&ip_resp, sizeof(struct ip_hdr));
+
+    // Prepare UDP header
+    udp_resp.sport = udph->dport; // Swap source and destination ports
+    udp_resp.dport = udph->sport;
+    udp_resp.len = htons(sizeof(struct udp_hdr) + udp_data_len); // Length of UDP header + data
+    udp_resp.csum = 0; // Checksum will be calculated later
+
+    // Allocate memory for the UDP packet (header + data)
+    unsigned char *udp_packet = (unsigned char *)malloc(sizeof(struct udp_hdr) + udp_data_len);
+    if (!udp_packet) {
+        perror("malloc");
+        return;
+    }
+
+    // Copy UDP header and data into the packet
+    unsigned char *udp_data = (unsigned char *)udph + sizeof(struct udp_hdr);
+    memcpy(udp_packet, &udp_resp, sizeof(struct udp_hdr));
+    memcpy(udp_packet + sizeof(struct udp_hdr), udp_data, udp_data_len);
+
+    // Calculate the UDP checksum
+    udp_resp.csum = calculate_checksum((unsigned short *)udp_packet, sizeof(struct udp_hdr) + udp_data_len);
+
+    // Update the checksum in the UDP packet
+    memcpy(udp_packet, &udp_resp, sizeof(struct udp_hdr));
+
+    // Debugging: Print the calculated checksum
+    if (debug == 1) {
+        printf("Calculated UDP Checksum: 0x%x\n", ntohs(udp_resp.csum));
+    }
+
+    // Debugging: Print response packet details
+    if (debug == 1) {
+        printf("Response Packet Length: %d\n", pph.caplen);
+        printf("Ethernet Header Length: %lu\n", sizeof(struct eth_hdr));
+        printf("IP Header Length: %lu\n", sizeof(struct ip_hdr));
+        printf("UDP Header Length: %lu\n", sizeof(struct udp_hdr));
+        printf("UDP Payload Length: %d\n", udp_data_len);
+    }
+
+    // Debugging: Print UDP response details
+    if (debug == 1) {
+        printf("UDP Response:\n");
+        printf("   |-Source Port      : %d\n", ntohs(udp_resp.sport));
+        printf("   |-Destination Port : %d\n", ntohs(udp_resp.dport));
+        printf("   |-Length           : %d\n", ntohs(udp_resp.len));
+        printf("   |-Checksum         : 0x%x\n", ntohs(udp_resp.csum));
+    }
+
+    // Prepare an array of iovec structures for the writev system call
+    struct iovec iov[10];
+    int v = 0;
+
+    // Add the Ethernet header to the iovec array
+    iov[v].iov_base = &eth_resp;
+    iov[v].iov_len = sizeof(struct eth_hdr);
+    ++v;
+
+    // Add the IP header to the iovec array
+    iov[v].iov_base = &ip_resp;
+    iov[v].iov_len = sizeof(struct ip_hdr);
+    ++v;
+
+    // Add the UDP packet (header + data) to the iovec array
+    iov[v].iov_base = udp_packet;
+    iov[v].iov_len = sizeof(struct udp_hdr) + udp_data_len;
+    ++v;
+
+    // Write the response
+    int rval = writev(writefd, iov, v);
+    if (rval < 0) {
+        perror("writev");
+    } else if (debug == 1) {
+        printf("Responded to UDP Echo Request with %d bytes\n", rval);
+    }
+
+    // Free the dynamically allocated buffer
+    free(udp_packet);
+}
+
 int main(int argc, char *argv[])
 {
     struct pcap_file_header pfh;
@@ -553,6 +675,12 @@ int main(int argc, char *argv[])
                 print_tcp_summary(tcph);
             } else if (iph->proto == IPPROTO_UDP) {
                 print_udp_summary(udph);
+                if (ntohs(udph->dport) == 7) { // Echo Protocol (port 7)
+                    printf("UDP Echo Request detected\n");
+                    respond_to_udp_echo_request(fd, &pph, eth, iph, udph, pph.caplen);
+                } else {
+                    printf("Other UDP packet detected (Source Port: %d, Destination Port: %d)\n", ntohs(udph->sport), ntohs(udph->dport));
+                }
             }
         } else if (ntohs(eth->type) == 0x0806) { // ARP EtherType value is 0x0806
             print_arp_summary(arph);
